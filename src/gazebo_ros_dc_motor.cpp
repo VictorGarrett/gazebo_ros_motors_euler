@@ -54,6 +54,7 @@ void GazeboRosMotor::Load ( physics::ModelPtr _parent, sdf::ElementPtr _sdf ) {
 
     // gearbox parameters
     gazebo_ros_->getParameter<double> ( gear_ratio_, "gear_ratio", 1.0 ); // Reduction!
+    ROS_INFO_NAMED(plugin_name_, "gear_ratio_ = %f", gear_ratio_);
 
     // encoder parameters
     gazebo_ros_->getParameterBoolean  ( publish_velocity_, "publish_velocity", true );
@@ -83,6 +84,7 @@ void GazeboRosMotor::Load ( physics::ModelPtr _parent, sdf::ElementPtr _sdf ) {
         joint_state_publisher_ = gazebo_ros_->node()->advertise<sensor_msgs::JointState>(joint_->GetName()+"/joint_state", 1000);
         ROS_INFO_NAMED(plugin_name_, "%s: Advertise joint_state", gazebo_ros_->info());
     }
+    this->joint_->SetProvideFeedback(true);
 
     if ( this->update_rate_ > 0.0 ) this->update_period_ = 1.0 / this->update_rate_; else this->update_period_ = 0.0;
     last_update_time_ = parent->GetWorld()->SimTime();
@@ -128,10 +130,13 @@ void GazeboRosMotor::Load ( physics::ModelPtr _parent, sdf::ElementPtr _sdf ) {
     // listen to the update event (broadcast every simulation iteration)
     this->update_connection_ = event::Events::ConnectWorldUpdateBegin ( boost::bind ( &GazeboRosMotor::UpdateChild, this ) );
 
+    this->post_update_connection_ = event::Events::ConnectWorldUpdateEnd(std::bind(&GazeboRosMotor::OnPostPhysicsUpdate, this));
+
     input_ = 0;
     encoder_counter_ = 0;
     internal_current_ = 0;
     internal_omega_ = 0;
+    last_applied_torque_ = 0;
     supply_voltage_ = motor_nominal_voltage_;
 
     // Set up dynamic_reconfigure server
@@ -151,6 +156,7 @@ void GazeboRosMotor::Reset() {
   encoder_counter_ = 0;
   internal_current_ = 0;
   internal_omega_ = 0;
+  last_applied_torque_ = 0;
   supply_voltage_ = motor_nominal_voltage_;
 }
 
@@ -309,7 +315,7 @@ void GazeboRosMotor::publishRotorVelocity(double m_vel){
 void GazeboRosMotor::publishEncoderCount(double m_vel, double dT){
   std_msgs::Int32 counter_msg;
   double rev_in_rad = m_vel * dT;
-  encoder_counter_ += ((rev_in_rad)/2*M_PI) * encoder_pulses_per_revolution_;
+  encoder_counter_ += ((rev_in_rad)/(2*M_PI)) * encoder_pulses_per_revolution_;
   counter_msg.data = encoder_counter_;
   if (this->publish_encoder_) encoder_publisher_.publish(counter_msg);
 }
@@ -320,24 +326,42 @@ void GazeboRosMotor::publishMotorCurrent(){
   if (this->publish_current_) current_publisher_.publish(c_msg);
 }
 
-// Motor Model update function
-void GazeboRosMotor::motorModelUpdate(double dt, double output_shaft_omega, double actual_load_torque) {
+// old Motor Model update function
+/*void GazeboRosMotor::motorModelUpdate(double dt, double output_shaft_omega, double total_torque) {
+
+    if (std::isnan(total_torque)) {
+      //ROS_WARN_NAMED(plugin_name_, "Total torque is NaN, skipping motor model update.");
+      return;
+    }
     if (input_ > 1.0) {
         input_ = 1.0;
     } else if (input_ < -1.0) {
         input_ = -1.0;
     }
-    double T = actual_load_torque / gear_ratio_; // external loading torque converted to internal side
+    //T = 0.1;
+
     double V = input_ * supply_voltage_; // power supply voltage * (command input for motor velocity)
+    double T = last_applied_torque_/gear_ratio_;
     internal_omega_ = output_shaft_omega * gear_ratio_; // external shaft angular veloc. converted to internal side
+    //double T = (last_applied_torque_+internal_omega_*0.01/gear_ratio_)/ gear_ratio_; // external loading torque minus what has been applied converted to internal side
+    //T = T - internal_omega_ * armature_damping_ratio_; // add damping torque
+    //T = (last_applied_torque_-output_shaft_omega*(0.01+100*0.0001))/gear_ratio_;
+    ROS_INFO_NAMED(plugin_name_, "[motorModelUpdate] dt = %f", dt);
+
+    // TODO: axis as param
     // DC motor exact solution for current and angular velocity (omega)
     const double& d = armature_damping_ratio_;
     const double& L = electric_inductance_;
     const double& R = electric_resistance_;
     const double& Km = electromotive_force_constant_;
     const double& J = moment_of_inertia_;
+    //double T = (total_torque*0.00125)*gear_ratio_*0.0001;
     double i0 = internal_current_;
     double o0 = internal_omega_;
+
+    ROS_INFO_NAMED(plugin_name_, "[motorModelUpdate] total trq = %f, damped trq = %f, internal_omega = %f, i_t = %f", last_applied_torque_, T, internal_omega_, internal_current_);
+
+
     double d2 = pow(d,2);
     double L2 = pow(L,2);
     double J2 = pow(J,2);
@@ -349,28 +373,104 @@ void GazeboRosMotor::motorModelUpdate(double dt, double output_shaft_omega, doub
     double eOm1 = eOp1 - 2.0; // = exp((Om*t)/(J*L)) - 1.0;
     double eA = exp(((d*L + Om + J*R)*dt)/(2.0*J*L));
     double emA = 1.0/eA; // = exp(-((d*L + Om + J*R)*t)/(2.0*J*L));
+
+
+
     double i_t = (emA*(i0*(Km2 + d*R)*(d*L*(d*eOp1*L + eOm1*Om) + eOp1*J2*R2 - J*(4*eOp1*Km2*L + 2*d*eOp1*L*R + eOm1*Om*R)) - d*L*(d*(-2*eA + eOp1)*L + eOm1*Om)*(Km*T + d*V) - (-2*eA + eOp1)*J2*R2*(Km*T + d*V) + J*(Km3*(-2*eOm1*o0*Om + 4*(-2*eA + eOp1)*L*T) - Km*R*(2*d*eOm1*o0*Om - 2*d*(-2*eA + eOp1)*L*T + eOm1*Om*T) + 2*Km2*(2*d*(-2*eA + eOp1)*L + eOm1*Om)*V + d*(2*d*(-2*eA + eOp1)*L + eOm1*Om)*R*V)))/ (2.*(Km2 + d*R)*(d2*L2 + J2*R2 - 2*J*L*(2*Km2 + d*R)));
     double o_t = (emA*(-4*eOp1*J*pow(Km,4)*L*o0 + J*Km2*R* (-6*d*eOp1*L*o0 + eOm1*o0*Om - 4*(-2*eA + eOp1)*L*T) + J*R2*(-2*d2*eOp1*L*o0 + d*eOm1*o0*Om - 2*d*(-2*eA + eOp1)*L*T + eOm1*Om*T) + 4*(-2*eA + eOp1)*J*Km3*L*V - J*Km*(-2*d*(-2*eA + eOp1)*L + eOm1*Om)*R*V + J2*R2*(eOp1*Km2*o0 + d*eOp1*o0*R + (-2*eA + eOp1)*R*T - (-2*eA + eOp1)*Km*V) + L*(pow(d,3)*eOp1*L*o0*R + 2*eOm1*Km2*Om*(i0*Km - T) + d2*(eOp1*Km2*L*o0 - eOm1*o0*Om*R + (-2*eA + eOp1)*L*R*T -  (-2*eA + eOp1)*Km*L*V) - d*eOm1*Om*(Km2*o0 + R*T + Km*(-2*i0*R + V)) )))/(2.*(Km2 + d*R)* (d2*L2 + J2*R2 - 2*J*L*(2*Km2 + d*R)));
+    
+    internal_acc_ = (o_t-internal_omega_)/dt;
+    //ignition::math::Vector3d applied_torque;
+    // TODO: axis as param
+    ignition::math::Vector3d applied_torque;
+    //applied_torque.Z() = (Km * i_t - o_t*d - (o_t-internal_omega_)*0.0001/dt) * gear_ratio_; // motor torque T_ext = K * i * n_gear
+    applied_torque.Z() = (internal_acc_/gear_ratio_) * 0.00125 + o_t*0.01/gear_ratio_ + T*gear_ratio_; // motor torque T_ext = K * i * n_gear
+    last_applied_torque_ = applied_torque.Z();
+    ROS_INFO_NAMED(plugin_name_,
+    "[motorModelUpdate] applying torque (external) = %f current = %f, internal_omega = %f", applied_torque.Z(), i_t, o_t);
+    this->link_->AddRelativeTorque(applied_torque);
+
     // Update internal variables
     internal_current_ = i_t;
-    internal_omega_   = o_t;
+    //internal_omega_   = o_t;
+}*/
+
+void GazeboRosMotor::motorModelUpdate(double dt, double output_shaft_omega, double total_torque) {
+  // Clamp command input between -1 and 1
+    input_ = std::clamp(input_, -1.0, 1.0);
+
+    // Compute motor supply voltage from command
+    double V = input_ * supply_voltage_;
+
+
+    // Compute internal rotor speed (ideal gear coupling)
+    double internal_omega = output_shaft_omega * gear_ratio_;
+    double dw = internal_omega - internal_omega_;
+
+    // Compute motor current using DC motor equation (no inductance)
+    double i_t = (V - internal_omega * electromotive_force_constant_) / electric_resistance_;
+
+    double inertial_torque = (dw/dt)*moment_of_inertia_;
+    // Limit inertial torque to a maximum of 2
+    //inertial_torque = std::clamp(inertial_torque, -0.05, 0.05);
+
+    // Compute torque on motor shaft
+    double internal_torque = electromotive_force_constant_ * i_t - internal_omega*armature_damping_ratio_;
+
+    // Reflect torque to output shaft
+    double output_torque = internal_torque * gear_ratio_;
+
+    // Apply torque to wheel link in Z-axis (assumes wheel spins around Z)
     ignition::math::Vector3d applied_torque;
-    // TODO: axis as param
-    applied_torque.Z() = Km * i_t * gear_ratio_; // motor torque T_ext = K * i * n_gear
-    this->link_->AddRelativeTorque(applied_torque);
+    applied_torque.Z() = output_torque;
+    link_->AddRelativeTorque(applied_torque);
+
+    // Update internal current state (for publishing)
+    internal_current_ = i_t;
+    last_applied_torque_ = output_torque;
+    internal_omega_ = internal_omega;
+
+    // Optional: Debug logging
+    //ROS_INFO_NAMED(plugin_name_, "[motorModelUpdate] dt=%f V = %.2f, i_t = %.3f, internal_omega = %.3f, output_torque = %.3f, i trq= %.3f", dt, V, i_t, internal_omega, output_torque, inertial_torque);
+
+}
+
+void GazeboRosMotor::OnPostPhysicsUpdate()
+{
+  // By now, Gazebo has applied your AddRelativeTorque() call
+  // plus damping, limits, contacts, etc.
+  double wheelSpeed   = joint_->GetVelocity(0u);
+  double jointReaction = joint_->GetForce(0u);
+  double totalTorque = link_->RelativeTorque().Z();
+
+  if (std::isnan(totalTorque)) {
+      //ROS_WARN_NAMED(plugin_name_, "Total torque is NaN, skipping motor model update.");
+      return;
+    }
+
+  printf("[OnPostPhysicsUpdate] wheel speed = %f, joint reaction = %f, total torque = %f, last torque = %f\n", wheelSpeed, jointReaction, totalTorque, last_applied_torque_);
+  this->last_applied_torque_ = last_applied_torque_-totalTorque;
 }
 
 // Plugin update function
 void GazeboRosMotor::UpdateChild() {
     common::Time current_time = parent->GetWorld()->SimTime();
     double seconds_since_last_update = ( current_time - last_update_time_ ).Double();
+    double seconds_since_last_model_update = ( current_time - last_model_update_time_ ).Double();
+
     double current_output_speed = joint_->GetVelocity( 0u );
+    //printf("vel %f\n", current_output_speed);
     ignition::math::Vector3d current_torque = this->link_->RelativeTorque();
     double actual_load = current_torque.Z();
 
-    motorModelUpdate(seconds_since_last_update, current_output_speed, actual_load);
+    if(seconds_since_last_model_update > 0.0 && seconds_since_last_model_update < 0.10) {
+        motorModelUpdate(seconds_since_last_model_update, current_output_speed, actual_load);
+    }
+        last_model_update_time_ = current_time;
+
 
     if ( seconds_since_last_update > update_period_ ) {
+        
         publishWheelJointState( current_output_speed, current_torque.Z() );
         publishMotorCurrent();
         auto dist = std::bind(std::normal_distribution<double>{current_output_speed, velocity_noise_},

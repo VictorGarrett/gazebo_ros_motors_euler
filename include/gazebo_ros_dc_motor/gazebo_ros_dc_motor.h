@@ -28,6 +28,9 @@
 #include <boost/thread.hpp>
 #include <boost/bind.hpp>
 
+#include <gazebo/sensors/SensorManager.hh>
+#include <gazebo/sensors/ForceTorqueSensor.hh>
+
 namespace gazebo {
 
   class Joint;
@@ -46,14 +49,20 @@ namespace gazebo {
 
     protected:
 
+      virtual void OnPostPhysicsUpdate();
       virtual void UpdateChild();
       virtual void FiniChild();
 
     private:
 
+      double ctrl_dt_;
+      double last_applied_torque_;
+      double torque_time_constant_;
+
       GazeboRosPtr gazebo_ros_;
       std::string plugin_name_;
       event::ConnectionPtr update_connection_;
+      event::ConnectionPtr post_update_connection_;
       physics::ModelPtr parent;
       physics::JointPtr joint_;
       physics::LinkPtr link_;
@@ -65,6 +74,7 @@ namespace gazebo {
       ros::Subscriber supply_voltage_subscriber_;
       sensor_msgs::JointState joint_state_;
       geometry_msgs::WrenchStamped wrench_msg_;
+      gazebo::sensors::ForceTorqueSensorPtr ft_sensor_;
 
       // Measurement noise
       double velocity_noise_;
@@ -98,6 +108,7 @@ namespace gazebo {
       // Internal state variables
       double internal_current_;
       double internal_omega_;
+      double internal_acc_;
 
       // Encoder model
       double encoder_counter_;
@@ -120,15 +131,20 @@ namespace gazebo {
       // Helper variables
       double update_period_;
       common::Time last_update_time_;
+      common::Time last_model_update_time_;
+
 
       void publishRotorVelocity(double m_vel);
       void publishEncoderCount(long ctr);
       void cmdVelCallback(const std_msgs::Float32::ConstPtr& cmd_msg);
       void supplyVoltageCallBack(const std_msgs::Float32::ConstPtr& voltage);
       void publishWheelJointState( double m_vel, double m_effort );
-      void motorModelUpdate(double dt, double actual_omega, double current_torque);
+      void motorModelUpdate(double dt, double actual_omega, double total_torque);
       void publishEncoderCount(double m_vel, double dT);
       void publishMotorCurrent();
+
+
+
   };
 
 }
