@@ -1,3 +1,8 @@
+# FORK NOTICE
+This fork was made to modify the update loop to shift the rotational dynamics to the Gazebo side. The update method has been changed to an euler integration because now the plugin does not know all the physical parameters for the exact solution.
+
+The encoder output calculation was also corrected.
+
 # Gazebo ROS motor plugins
 
 This repository contains currently <u>two</u> motor plugins, one with an ideal speed controller and one without a controller that models a DC motor. *Planning to extend the package with AC, BLDC, stepper and servo motor models as well...*
